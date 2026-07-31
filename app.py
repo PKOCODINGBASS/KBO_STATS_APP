@@ -1284,6 +1284,431 @@ def predire_joueurs_du_jour(cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, t
 
 
 # ============================================================
+# 5 bis. "HOT PRONOSTICS" - Scan GLOBAL de tous les matchs du jour
+# ============================================================
+# Contrairement aux fonctions ci-dessus (centrées sur UNE équipe sélectionnée dans la
+# sidebar), ce bloc analyse TOUS les matchs prévus aujourd'hui (heure de Corée), toutes
+# équipes confondues, pour en extraire les meilleurs pronostics HR / Runs / Victoire du
+# jour - même principe que le module équivalent de l'app MLB, mais l'API Naver Sports
+# (source KBO, voir docstring d'en-tête du fichier) n'offre PAS les deux facilités dont
+# dispose MLB StatsAPI, ce qui impose deux adaptations documentées ci-dessous :
+#
+# 1. PAS d'endpoint "lineups" pré-match : `schedule/games/{id}/record` renvoie
+#    `recordData: null` tant qu'un match n'a pas commencé (vérifié empiriquement), alors
+#    que MLB StatsAPI publie les lineups officielles 1 à 3h avant le match. En repli, la
+#    "lineup probable" du jour est estimée à partir des 9 TITULAIRES (champ `batOrder`
+#    1-9, en excluant les entrées `substituteIn`) du DERNIER match TERMINÉ de l'équipe -
+#    une estimation raisonnable (les entraîneurs KBO changent rarement l'intégralité de
+#    leur ordre de frappe d'un match à l'autre) mais PAS une garantie, clairement
+#    annoncée comme telle dans l'interface.
+# 2. PAS d'endpoint "lastXGames" agrégé côté frappeurs : la forme récente (SLG/OBP sur les
+#    10 derniers matchs) est donc calculée manuellement en additionnant les boxscores des
+#    10 derniers matchs TERMINÉS de l'équipe (AB, Hits, HR, BB par joueur - mêmes champs
+#    que ceux déjà utilisés par `get_stats_offensives_match` pour l'onglet "Analyse par
+#    Équipe", mais ici on a aussi besoin de `batOrder`/`ab`/`bb`, d'où une fonction de
+#    récupération de boxscore dédiée `obtenir_boxscore_complet_match`). Cette API ne
+#    distingue PAS les doubles/triples des simples au niveau d'un boxscore de match (seul
+#    le nombre total de coups sûrs "hit" est renvoyé, sans détail par type - contrairement
+#    aux statistiques de SAISON qui, elles, exposent `hitterH2`/`hitterH3`) : le SLG récent
+#    est donc une ESTIMATION (bases totales ≈ hits + 3×HR, c.-à-d. tout coup sûr non-HR est
+#    traité comme un simple), documentée comme telle dans les libellés de colonnes et la
+#    méthodologie affichée sous les tableaux - PAS le vrai SLG (qui compterait les doubles
+#    à 2 et les triples à 3).
+
+def _estimer_slg_recent(ab: int, hit: int, hr: int) -> float:
+    """
+    Estime le SLG (slugging percentage) sur une fenêtre de matchs à partir de AB/Hits/HR
+    seuls (sans détail doubles/triples, non disponible match par match dans l'API Naver
+    Sports - voir le commentaire de section ci-dessus). Hypothèse simplificatrice : tout
+    coup sûr qui n'est pas un HR est traité comme un simple (1 base), un HR valant 4 bases
+    (soit +3 bases par rapport au 1 déjà compté dans `hit`) -> bases totales ≈ hit + 3*hr.
+    Sous-estime légèrement le vrai SLG dès qu'un joueur a frappé des doubles/triples
+    récents, mais reste un indicateur cohérent pour un CLASSEMENT relatif entre joueurs.
+    """
+    if not ab:
+        return 0.0
+    bases_totales_estimees = hit + 3 * hr
+    return bases_totales_estimees / ab
+
+
+def _estimer_obp_recent(ab: int, hit: int, bb: int) -> float:
+    """
+    Estime l'OBP (on-base percentage) sur une fenêtre de matchs à partir de AB/Hits/BB
+    seuls. L'API Naver Sports ne fournit pas le nombre de "hit by pitch" (HBP) ni de
+    sacrifice flies (SF) au niveau d'un boxscore de match, contrairement à la formule
+    officielle OBP = (H+BB+HBP)/(AB+BB+HBP+SF) : l'approximation retenue ici,
+    (H+BB)/(AB+BB), ignore ces deux termes généralement marginaux (un joueur atteint très
+    rarement la base sur HBP, et un SF ne compte de toute façon pas comme un at-bat).
+    """
+    denominateur = ab + bb
+    if not denominateur:
+        return 0.0
+    return (hit + bb) / denominateur
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_moyennes_runs_10_toutes_equipes(annee: int) -> dict:
+    """
+    Calcule, pour CHACUNE des 10 équipes KBO, la moyenne de runs marqués sur ses 10
+    derniers matchs TERMINÉS, en réutilisant directement `charger_donnees_equipe` (déjà
+    mis en cache par équipe) - donc SANS appel réseau supplémentaire au-delà des
+    calendriers mensuels déjà partagés entre toutes les équipes via `charger_calendrier_
+    mensuel`. Retourne un dict {code_equipe: moyenne_runs} (une équipe sans historique
+    suffisant cette saison est simplement absente du dict).
+    """
+    moyennes = {}
+    for code_equipe in TEAMS_KBO:
+        df_equipe = charger_donnees_equipe(annee, code_equipe)
+        if df_equipe.empty or 'R' not in df_equipe.columns:
+            continue
+        dix_derniers = df_equipe.tail(10)
+        moyenne = pd.to_numeric(dix_derniers['R'], errors='coerce').mean()
+        if pd.notna(moyenne):
+            moyennes[code_equipe] = moyenne
+    return moyennes
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_boxscore_complet_match(game_id: str, est_domicile: bool) -> list:
+    """
+    Récupère le boxscore batteur-par-batteur COMPLET (pas seulement runs/HR comme
+    `get_stats_offensives_match`, utilisée par l'onglet "Analyse par Équipe") d'un match
+    terminé, avec en plus les champs `batOrder` (position dans l'ordre de passage, 1-9
+    pour un titulaire), `ab`/`bb` (nécessaires pour estimer OBP/SLG récents) et
+    `est_titulaire` (True si le joueur a débuté le match dans cet ordre de frappe, False
+    s'il s'agit d'un remplaçant entré en cours de match, càd `substituteIn` = True côté
+    API). Fonction séparée et mise en cache indépendamment de `get_stats_offensives_match`
+    (même endpoint, champs différents) pour ne prendre aucun risque de régression sur
+    l'onglet "Analyse par Équipe" existant.
+    """
+    if not game_id:
+        return []
+    url = f"{BASE_NAVER}/schedule/games/{game_id}/record"
+    try:
+        data = appeler_avec_retry(_get_json, url)
+    except Exception:
+        return []
+
+    record_data = (data.get('result', {}) or {}).get('recordData', {}) or {}
+    if not record_data:
+        return []
+    batters_boxscore = record_data.get('battersBoxscore', {}) or {}
+    liste_joueurs = batters_boxscore.get('home' if est_domicile else 'away', []) or []
+
+    resultats = []
+    for j in liste_joueurs:
+        player_code = str(j.get('playerCode') or '')
+        if not player_code:
+            continue
+        bat_order = j.get('batOrder')
+        resultats.append({
+            'playerCode': player_code,
+            'nom_hangul': j.get('name') or '',
+            'batOrder': bat_order if isinstance(bat_order, int) else None,
+            'est_titulaire': not bool(j.get('substituteIn')),
+            'ab': int(j.get('ab') or 0),
+            'hit': int(j.get('hit') or 0),
+            'hr': int(j.get('hr') or 0),
+            'bb': int(j.get('bb') or 0),
+        })
+    return resultats
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_lineup_probable_et_forme_recente(annee: int, code_equipe: str) -> dict:
+    """
+    Pour une équipe donnée, construit :
+      1. une estimation de sa lineup PROBABLE du jour (voir limitation documentée en tête
+         de section 5 bis) = les 9 titulaires (`batOrder` 1-9) du match TERMINÉ le plus
+         RÉCENT parmi les 10 derniers de l'équipe (avec repli sur le match précédent si le
+         boxscore du plus récent est temporairement indisponible - dégradation gracieuse
+         plutôt qu'une lineup vide) ;
+      2. leur forme offensive CUMULÉE (AB, Hits, HR, BB) sur ces mêmes 10 derniers matchs,
+         utilisée ensuite pour estimer leur SLG/OBP récents (`_estimer_slg_recent` /
+         `_estimer_obp_recent`).
+
+    Retourne un dict {playerCode: {'nom_hangul', 'position_probable', 'ab_10', 'hit_10',
+    'hr_10', 'bb_10'}}, restreint aux 9 joueurs de la lineup probable identifiée (un
+    banc/bullpen entier n'a pas d'intérêt ici, seuls les titulaires probables comptent).
+    Dict vide si l'équipe n'a aucun historique exploitable cette saison.
+    """
+    df_equipe = charger_donnees_equipe(annee, code_equipe)
+    if df_equipe.empty or 'game_id' not in df_equipe.columns:
+        return {}
+
+    dix_derniers = df_equipe.tail(10)
+    if dix_derniers.empty:
+        return {}
+
+    cumul_par_joueur = {}   # playerCode -> {'nom_hangul', 'ab', 'hit', 'hr', 'bb'}
+    boxscores_par_match = []  # dans l'ordre chronologique (le dernier élément = match le + récent)
+
+    for _, ligne in dix_derniers.iterrows():
+        boxscore = obtenir_boxscore_complet_match(ligne['game_id'], bool(ligne['Est_Domicile']))
+        boxscores_par_match.append(boxscore)
+        for j in boxscore:
+            entree = cumul_par_joueur.setdefault(
+                j['playerCode'], {'nom_hangul': j['nom_hangul'], 'ab': 0, 'hit': 0, 'hr': 0, 'bb': 0}
+            )
+            entree['ab'] += j['ab']
+            entree['hit'] += j['hit']
+            entree['hr'] += j['hr']
+            entree['bb'] += j['bb']
+
+    # Lineup probable = titulaires du match le plus RÉCENT parmi les 10 pour lequel le
+    # boxscore a pu être récupéré avec succès (on parcourt à l'envers, du plus récent au
+    # plus ancien, et on s'arrête au premier match exploitable).
+    lineup_probable = {}
+    for boxscore in reversed(boxscores_par_match):
+        candidate = {
+            j['playerCode']: j['batOrder']
+            for j in boxscore
+            if j['est_titulaire'] and j['batOrder'] is not None and 1 <= j['batOrder'] <= 9
+        }
+        if candidate:
+            lineup_probable = candidate
+            break
+
+    resultats = {}
+    for player_code, position in lineup_probable.items():
+        stats = cumul_par_joueur.get(player_code)
+        if not stats:
+            continue
+        resultats[player_code] = {
+            'nom_hangul': stats['nom_hangul'],
+            'position_probable': position,
+            'ab_10': stats['ab'],
+            'hit_10': stats['hit'],
+            'hr_10': stats['hr'],
+            'bb_10': stats['bb'],
+        }
+    return resultats
+
+
+def _normaliser_colonne_hp(serie: pd.Series) -> pd.Series:
+    """
+    Normalisation min-max dans [0, 1] d'une colonne de statistiques, pour pouvoir
+    combiner des métriques d'échelles très différentes (ex: SLG ~0.3-0.6, HR sur 10
+    matchs 0-6, ERA 2-6) dans un même indice pondéré. Renvoie une série neutre à 0.5
+    si la colonne est constante (évite une division par zéro sans fausser le classement).
+    Suffixe "_hp" ("Hot Pronostics") pour éviter toute collision de nom si une fonction
+    de normalisation similaire existait déjà ailleurs dans le fichier.
+    """
+    minimum, maximum = serie.min(), serie.max()
+    if pd.isna(minimum) or pd.isna(maximum) or maximum == minimum:
+        return pd.Series([0.5] * len(serie), index=serie.index)
+    return (serie - minimum) / (maximum - minimum)
+
+
+def _calculer_top5_home_runs_kbo(candidats: list) -> pd.DataFrame:
+    """
+    Construit le classement "Top 5 Home Runs probables" à partir de la liste de candidats
+    (un dict par titulaire probable d'un match du jour). Indice pondéré : SLG récent
+    estimé 45% + HR/10 derniers matchs 35% + HR/9 du lanceur adverse 20% (les 3 facteurs
+    demandés), chaque métrique étant normalisée (min-max) sur l'ensemble des candidats du
+    jour avant pondération.
+    """
+    if not candidats:
+        return pd.DataFrame()
+    df = pd.DataFrame(candidats)
+    indice = (
+        _normaliser_colonne_hp(df['SLG récent (estimé)']) * 0.45
+        + _normaliser_colonne_hp(df['HR (10 derniers matchs)']) * 0.35
+        + _normaliser_colonne_hp(df['HR/9 lanceur adverse']) * 0.20
+    ) * 100
+    df['Indice HR (/100)'] = indice.round(1)
+    df = df.sort_values('Indice HR (/100)', ascending=False).head(5).reset_index(drop=True)
+    return df[[
+        'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
+        'SLG récent (estimé)', 'HR (10 derniers matchs)', 'HR/9 lanceur adverse', 'Indice HR (/100)'
+    ]]
+
+
+def _calculer_top5_runs_kbo(candidats: list) -> pd.DataFrame:
+    """
+    Construit le classement "Top 5 joueurs pour marquer un run" à partir de la liste de
+    candidats. Indice pondéré : OBP récent estimé 45% + bonus de position dans la lineup
+    probable (favorise les positions 1 à 4) 25% + ERA du lanceur adverse 30%, chaque
+    métrique étant normalisée (min-max) sur l'ensemble des candidats du jour.
+    """
+    if not candidats:
+        return pd.DataFrame()
+    df = pd.DataFrame(candidats)
+    # Bonus de position : décroît linéairement de la place 1 (bonus max) à la place 9
+    # (bonus nul), pour "privilégier les batteurs 1 à 4" tout en restant continu.
+    bonus_position = (9 - df['Position probable']).clip(lower=0)
+    indice = (
+        _normaliser_colonne_hp(df['OBP récent (estimé)']) * 0.45
+        + _normaliser_colonne_hp(bonus_position) * 0.25
+        + _normaliser_colonne_hp(df['ERA lanceur adverse']) * 0.30
+    ) * 100
+    df['Indice Run (/100)'] = indice.round(1)
+    df = df.sort_values('Indice Run (/100)', ascending=False).head(5).reset_index(drop=True)
+    return df[[
+        'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
+        'OBP récent (estimé)', 'Position probable', 'ERA lanceur adverse', 'Indice Run (/100)'
+    ]]
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def construire_donnees_hot_pronostics_kbo(annee: int):
+    """
+    Calcul GLOBAL et coûteux (mis en cache via @st.cache_data, ttl=30min) qui scanne TOUS
+    les matchs KBO du jour (heure de Corée) et construit les 3 tableaux de l'onglet
+    "Hot Pronostics" : Top 5 Home Runs, Top 5 joueurs pour marquer un run, et le
+    récapitulatif Win/Lose de chaque confrontation. Ce calcul est indépendant de l'équipe
+    sélectionnée dans la sidebar, donc mis en cache séparément (clé = `annee` uniquement)
+    pour ne jamais être relancé inutilement quand l'utilisateur change d'équipe.
+
+    Retourne (matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires).
+    """
+    if annee != ANNEE_COURANTE:
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df_jour, _ = obtenir_calendrier_du_jour_kst()
+    if df_jour.empty:
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    effectifs = _charger_effectifs_saison(annee)
+    dict_noms_anglais = _dict_noms_anglais(annee)
+    moyennes_runs_equipes = obtenir_moyennes_runs_10_toutes_equipes(annee)
+
+    matchs_du_jour = []
+    codes_du_jour = set()
+    for _, g in df_jour.iterrows():
+        code_home, code_away = g.get('code_home'), g.get('code_away')
+        if not code_home or not code_away:
+            continue  # code d'équipe non résolu (cas très rare, voir NOM_EQUIPE_VERS_CODE) -> match ignoré
+        codes_du_jour.update([code_home, code_away])
+
+        heure_kst_str, heure_paris_str = "—", "—"
+        game_datetime_str = g.get('game_datetime')
+        if game_datetime_str:
+            try:
+                dt_kst = datetime.fromisoformat(game_datetime_str).replace(tzinfo=TZ_SEOUL)
+                heure_kst_str = dt_kst.strftime('%H:%M')
+                heure_paris_str = dt_kst.astimezone(TZ_PARIS).strftime('%d/%m à %H:%M')
+            except Exception:
+                pass
+
+        matchs_du_jour.append({
+            'game_id': g.get('game_id'),
+            'code_home': code_home,
+            'code_away': code_away,
+            'nom_home': TEAMS_KBO.get(code_home, g.get('nom_home')),
+            'nom_away': TEAMS_KBO.get(code_away, g.get('nom_away')),
+            'lanceur_home_hangul': (g.get('lanceur_annonce_home') or '').strip(),
+            'lanceur_away_hangul': (g.get('lanceur_annonce_away') or '').strip(),
+            'stade': traduire_stade(g.get('stade')),
+            'heure_kst': heure_kst_str,
+            'heure_paris': heure_paris_str,
+            'statut': g.get('statusCode'),
+        })
+
+    if not matchs_du_jour:
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Une seule estimation de lineup probable + forme récente par équipe présente
+    # aujourd'hui (pas par match), même si une équipe jouait deux fois le même jour.
+    lineups_par_equipe = {
+        code: obtenir_lineup_probable_et_forme_recente(annee, code) for code in codes_du_jour
+    }
+
+    candidats_hr = []
+    candidats_runs = []
+    lignes_victoire = []
+
+    for m in matchs_du_jour:
+        stats_p_home = (
+            obtenir_infos_lanceur(m['lanceur_home_hangul'], m['code_home'], effectifs)
+            if m['lanceur_home_hangul'] else None
+        )
+        stats_p_away = (
+            obtenir_infos_lanceur(m['lanceur_away_hangul'], m['code_away'], effectifs)
+            if m['lanceur_away_hangul'] else None
+        )
+
+        # --- Tableau Win/Lose : on réutilise TEL QUEL le modèle heuristique déjà validé
+        # dans l'onglet "Prédictions du jour" (`predire_probabilite_victoire`), avec les
+        # vraies moyennes de runs des DEUX équipes (au lieu du proxy "runs concédés par
+        # notre équipe" utilisé côté mono-équipe, où l'attaque adverse n'est pas
+        # directement disponible sans recharger un second historique).
+        pct_home, pct_away = predire_probabilite_victoire(
+            moyennes_runs_equipes.get(m['code_home']),
+            moyennes_runs_equipes.get(m['code_away']),
+            stats_p_home,
+            stats_p_away,
+            est_domicile=True,
+        )
+        nom_lanceur_home_aff = (
+            stats_p_home['nom'] if stats_p_home
+            else (nom_hangul_vers_romanisation(m['lanceur_home_hangul']) if m['lanceur_home_hangul'] else 'Non annoncé')
+        )
+        nom_lanceur_away_aff = (
+            stats_p_away['nom'] if stats_p_away
+            else (nom_hangul_vers_romanisation(m['lanceur_away_hangul']) if m['lanceur_away_hangul'] else 'Non annoncé')
+        )
+        lignes_victoire.append({
+            'Heure (France)': m['heure_paris'],
+            'Équipe Domicile': m['nom_home'],
+            'Lanceur Domicile': nom_lanceur_home_aff,
+            'Équipe Extérieur': m['nom_away'],
+            'Lanceur Extérieur': nom_lanceur_away_aff,
+            'Proba Domicile (%)': pct_home,
+            'Proba Extérieur (%)': pct_away,
+        })
+
+        # --- Candidats HR / Runs : chaque lineup probable est croisée avec le lanceur
+        # partant ADVERSE (celui qu'elle affrontera aujourd'hui). On exige au moins 5 AB
+        # cumulés sur les 10 derniers matchs pour filtrer le bruit d'un joueur tout juste
+        # rappelé (échantillon trop faible pour un OBP/SLG récent significatif).
+        for code_equipe, nom_equipe, nom_adverse, stats_lanceur_adverse in (
+            (m['code_home'], m['nom_home'], m['nom_away'], stats_p_away),
+            (m['code_away'], m['nom_away'], m['nom_home'], stats_p_home),
+        ):
+            nom_lanceur_adverse_aff = stats_lanceur_adverse['nom'] if stats_lanceur_adverse else 'Non annoncé'
+            hr_par_9_adverse = (
+                stats_lanceur_adverse['hr_par_9']
+                if stats_lanceur_adverse and stats_lanceur_adverse.get('hr_par_9') else 1.0
+            )
+            era_adverse = (
+                stats_lanceur_adverse['era']
+                if stats_lanceur_adverse and stats_lanceur_adverse.get('era') else 4.5
+            )
+
+            for player_code, infos in lineups_par_equipe.get(code_equipe, {}).items():
+                if infos['ab_10'] < 5:
+                    continue
+                nom_anglais = dict_noms_anglais.get(player_code)
+                nom_affiche = nom_anglais if nom_anglais else nom_hangul_vers_romanisation(infos['nom_hangul'])
+
+                candidats_hr.append({
+                    'Joueur': nom_affiche,
+                    'Équipe': nom_equipe,
+                    'Adversaire': nom_adverse,
+                    'Lanceur adverse': nom_lanceur_adverse_aff,
+                    'SLG récent (estimé)': round(_estimer_slg_recent(infos['ab_10'], infos['hit_10'], infos['hr_10']), 3),
+                    'HR (10 derniers matchs)': infos['hr_10'],
+                    'HR/9 lanceur adverse': round(hr_par_9_adverse, 2),
+                })
+                candidats_runs.append({
+                    'Joueur': nom_affiche,
+                    'Équipe': nom_equipe,
+                    'Adversaire': nom_adverse,
+                    'Lanceur adverse': nom_lanceur_adverse_aff,
+                    'OBP récent (estimé)': round(_estimer_obp_recent(infos['ab_10'], infos['hit_10'], infos['bb_10']), 3),
+                    'Position probable': infos['position_probable'],
+                    'ERA lanceur adverse': round(era_adverse, 2),
+                })
+
+    df_top5_hr = _calculer_top5_home_runs_kbo(candidats_hr)
+    df_top5_runs = _calculer_top5_runs_kbo(candidats_runs)
+    df_victoires = pd.DataFrame(lignes_victoire)
+
+    return matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires
+
+
+# ============================================================
 # 6. INTERFACE PRINCIPALE
 # ============================================================
 
@@ -1335,14 +1760,129 @@ EQUIPES_KBO = get_teams_kbo(annee)
 # 7. ONGLETS PRINCIPAUX
 # ============================================================
 onglets = st.tabs([
+    "🔥 Hot Pronostics",
     "📊 Analyse par Équipe",
     "🔮 Prédictions du jour"
-])
+], on_change="rerun")
 
 # --------------------------------------------------------------
-# ONGLET 1: ANALYSE PAR ÉQUIPE
+# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
 # --------------------------------------------------------------
 with onglets[0]:
+    if onglets[0].open:
+        st.header("🔥 Hot Pronostics du jour")
+        st.markdown("### Les meilleurs pronostics du jour, tous matchs KBO confondus")
+        st.caption(
+            "⚠️ Estimations statistiques automatiques calculées à partir des lineups PROBABLES "
+            "(estimées d'après le dernier match connu de chaque équipe - l'API KBO utilisée par "
+            "cette application ne publie pas de lineup officielle avant le début du match, "
+            "contrairement à MLB StatsAPI), des lanceurs partants annoncés et de la forme "
+            "récente des joueurs. Ce ne sont pas des garanties de résultat : simples "
+            "heuristiques, à utiliser uniquement à titre informatif, avec discernement si vous "
+            "vous en servez pour parier."
+        )
+
+        if annee != ANNEE_COURANTE:
+            st.info(
+                f"Les Hot Pronostics ne sont disponibles que pour la saison en cours "
+                f"({ANNEE_COURANTE}). Sélectionnez {ANNEE_COURANTE} dans le menu de gauche."
+            )
+        else:
+            with st.spinner(
+                "Analyse de tous les matchs KBO du jour (lineups probables, lanceurs, forme "
+                "récente)... Premier chargement potentiellement long (plusieurs dizaines "
+                "d'appels réseau), les suivants seront quasi instantanés grâce au cache."
+            ):
+                matchs_jour, df_top5_hr, df_top5_runs, df_victoires = construire_donnees_hot_pronostics_kbo(annee)
+
+            if not matchs_jour:
+                st.info("Aucun match KBO n'est prévu aujourd'hui (heure de Corée).")
+            else:
+                st.caption(
+                    f"📅 {len(matchs_jour)} match(s) KBO au programme aujourd'hui (heure de Corée)."
+                )
+
+                st.markdown("---")
+                st.subheader("💣 Top 5 Home Runs probables")
+                if df_top5_hr.empty:
+                    st.info(
+                        "Aucun candidat exploitable pour le moment (historique de match "
+                        "insuffisant pour au moins une des équipes du jour)."
+                    )
+                else:
+                    st.dataframe(
+                        df_top5_hr,
+                        column_config={
+                            "SLG récent (estimé)": st.column_config.NumberColumn("SLG récent (estimé)", format="%.3f"),
+                            "HR (10 derniers matchs)": st.column_config.NumberColumn("HR (10 derniers matchs)", format="%d"),
+                            "HR/9 lanceur adverse": st.column_config.NumberColumn("HR/9 lanceur adverse", format="%.2f"),
+                            "Indice HR (/100)": st.column_config.ProgressColumn(
+                                "Indice HR (/100)", min_value=0, max_value=100, format="%.0f"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.markdown("---")
+                st.subheader("🏃 Top 5 joueurs pour marquer un run")
+                if df_top5_runs.empty:
+                    st.info(
+                        "Aucun candidat exploitable pour le moment (historique de match "
+                        "insuffisant pour au moins une des équipes du jour)."
+                    )
+                else:
+                    st.dataframe(
+                        df_top5_runs,
+                        column_config={
+                            "OBP récent (estimé)": st.column_config.NumberColumn("OBP récent (estimé)", format="%.3f"),
+                            "Position probable": st.column_config.NumberColumn("Position probable", format="%d"),
+                            "ERA lanceur adverse": st.column_config.NumberColumn("ERA lanceur adverse", format="%.2f"),
+                            "Indice Run (/100)": st.column_config.ProgressColumn(
+                                "Indice Run (/100)", min_value=0, max_value=100, format="%.0f"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.markdown("---")
+                st.subheader("🎲 Probabilités Win/Lose du jour")
+                if df_victoires.empty:
+                    st.info("Aucune donnée de probabilité de victoire disponible pour le moment.")
+                else:
+                    st.dataframe(
+                        df_victoires,
+                        column_config={
+                            "Proba Domicile (%)": st.column_config.ProgressColumn(
+                                "Proba Domicile (%)", min_value=0, max_value=100, format="%.1f%%"
+                            ),
+                            "Proba Extérieur (%)": st.column_config.ProgressColumn(
+                                "Proba Extérieur (%)", min_value=0, max_value=100, format="%.1f%%"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.caption(
+                    "**Méthodologie** — Home Runs : SLG récent estimé (45%) + HR sur les 10 "
+                    "derniers matchs (35%) + HR/9 du lanceur partant adverse (20%). Runs : OBP "
+                    "récent estimé (45%) + position dans la lineup probable (25%, positions 1 à "
+                    "4 favorisées) + ERA du lanceur partant adverse (30%). Win/Lose : moyenne de "
+                    "runs marqués sur les 10 derniers matchs de chaque équipe + ERA/WHIP des "
+                    "lanceurs partants annoncés du jour (même modèle que l'onglet \"Prédictions "
+                    "du jour\", détaillé plus bas). Chaque indice est normalisé sur l'ensemble "
+                    "des candidats du jour, donc relatif à la journée en cours. **Limite "
+                    "spécifique KBO** : à défaut de lineup officielle publiée avant match par "
+                    "l'API utilisée, la lineup \"probable\" est estimée à partir du dernier match "
+                    "terminé de chaque équipe (position au bâton généralement stable d'un match "
+                    "à l'autre, mais pas garantie) ; de même le SLG/OBP récents sont des "
+                    "estimations (l'API ne distingue pas doubles/triples/HBP au niveau d'un "
+                    "boxscore de match, contrairement aux statistiques de saison)."
+                )
+
+# --------------------------------------------------------------
+# ONGLET 2: ANALYSE PAR ÉQUIPE
+# --------------------------------------------------------------
+with onglets[1]:
     st.header("📊 Analyse des Runs par Équipe")
 
     col1, col2 = st.columns([1, 3])
@@ -1562,9 +2102,9 @@ with onglets[0]:
         st.error("Impossible de charger les données. Vérifiez le code de l'équipe, ou réessayez : l'API Naver Sports peut être temporairement indisponible.")
 
 # --------------------------------------------------------------
-# ONGLET 2: PRÉDICTIONS DU JOUR
+# ONGLET 3: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
-with onglets[1]:
+with onglets[2]:
     st.header("🔮 Prédictions du jour")
     st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_KBO.get(equipe_abbr, equipe_abbr)}**")
     st.caption(
