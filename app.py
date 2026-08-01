@@ -466,6 +466,7 @@ def charger_calendrier_mensuel(annee: int, mois: int) -> pd.DataFrame:
             "lanceur_annonce_away": (g.get('awayStarterName') or '').strip(),
             "lanceur_gagnant": (g.get('winPitcherName') or '').strip(),
             "lanceur_perdant": (g.get('losePitcherName') or '').strip(),
+            "suspended": g.get('suspended'),
         })
 
     return pd.DataFrame(lignes)
@@ -1709,6 +1710,323 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
 
 
 # ============================================================
+# 5 ter. ONGLET "RÉSUMÉ" - Scores en direct et terminés du jour
+# ============================================================
+# Ce bloc alimente le tout premier onglet de l'application : un tableau récapitulatif de
+# TOUS les matchs KBO du jour (à venir / en cours / terminés), avec un bouton de
+# rafraîchissement manuel qui ne recharge QUE cet onglet (via `st.fragment`), pas toute la
+# page. Il réutilise le modèle de prédiction déjà calculé pour "Hot Pronostics"
+# (`construire_donnees_hot_pronostics_kbo`) pour la colonne "Comparatif Prédiction", au lieu
+# de dupliquer le calcul de probabilité de victoire. Adaptation à l'identique de l'onglet
+# "Résumé" de l'app MLB (qui s'appuie sur statsapi), ici branchée sur l'API interne Naver
+# Sports (voir docstring d'en-tête du fichier).
+
+def _ordinal_anglais(n) -> str:
+    """Formate un entier en ordinal anglais (1 -> '1st', 4 -> '4th', 11 -> '11th', ...)."""
+    n = int(n)
+    if 10 <= (n % 100) <= 20:
+        suffixe = 'th'
+    else:
+        suffixe = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f"{n}{suffixe}"
+
+
+def _formater_statut_match_kbo(g) -> str:
+    """
+    Traduit les champs bruts Naver Sports ('statusCode', 'statusInfo', 'suspended') en
+    l'une des catégories demandées : 'À venir', 'En cours (Top 4th)' ou 'Terminé' - avec un
+    repli explicite pour les statuts rares (suspendu) plutôt que de les faire tomber
+    silencieusement dans une mauvaise catégorie.
+
+    'statusCode' vaut 'BEFORE' (avant match), 'STARTED' (en direct) ou 'RESULT' (terminé) -
+    valeurs vérifiées empiriquement sur l'API réelle (voir aussi le projet open-source
+    hanwha-score, qui compare exactement ces trois chaînes). Les matchs annulés ('cancel')
+    sont déjà exclus en amont par `charger_calendrier_mensuel`, donc ce cas n'a normalement
+    pas besoin d'être géré ici, mais le repli 'À venir' reste sûr si jamais un tel match
+    apparaissait malgré tout.
+
+    Quand le match est en direct, 'statusInfo' contient l'inning courant en coréen (ex:
+    '5회말' = demi-manche du bas de la 5e) : on le reformate en 'Top'/'Bot' + ordinal anglais,
+    par symétrie avec le format utilisé côté MLB ('Bot 4th').
+    """
+    if g.get('suspended'):
+        return "Suspendu"
+
+    status_code = str(g.get('statusCode') or '').strip().upper()
+
+    if status_code == 'RESULT':
+        return "Terminé"
+
+    if status_code == 'STARTED':
+        info = str(g.get('statusInfo') or '').strip()
+        m = re.match(r'^(\d+)\s*회\s*(초|말)', info)
+        if m:
+            manche_str = _ordinal_anglais(m.group(1))
+            demi = "Top" if m.group(2) == '초' else "Bot"
+            return f"En cours ({demi} {manche_str})"
+        return "En cours"
+
+    return "À venir"  # 'BEFORE', ou tout statut inconnu
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
+def obtenir_hr_joueurs_match_resume(game_id: str, est_domicile: bool, dict_noms_anglais: dict = None, cache_bust: int = 0):
+    """
+    Récupère, via le boxscore Naver Sports d'un match (endpoint "/record"), la liste des
+    home runs marqués par chaque joueur d'une équipe (domicile ou extérieur) sous forme de
+    tuples (nom_joueur, nb_hr). Fonction dédiée à l'onglet "Résumé" (plutôt que de réutiliser
+    `get_stats_offensives_match`, partagée avec l'onglet "Analyse par Équipe" et jamais
+    invalidée) car ici le match peut être EN COURS : `cache_bust` change la clé de cache
+    Streamlit à la demande (incrémenté par le bouton "Rafraîchir"), ce qui permet de forcer
+    un nouvel appel réseau sans dépendre d'un simple TTL. Le paramètre n'est jamais lu dans
+    le corps de la fonction, il ne sert qu'à invalider le cache. `ttl=3600` reste un filet de
+    sécurité pour éviter une croissance illimitée du cache, pas le mécanisme principal de
+    fraîcheur des données.
+    """
+    if not game_id:
+        return []
+    dict_noms_anglais = dict_noms_anglais or {}
+
+    url = f"{BASE_NAVER}/schedule/games/{game_id}/record"
+    try:
+        data = appeler_avec_retry(_get_json, url)
+        record_data = (data.get('result', {}) or {}).get('recordData', {}) or {}
+        batters_boxscore = record_data.get('battersBoxscore', {}) or {}
+        liste_joueurs = batters_boxscore.get('home' if est_domicile else 'away', []) or []
+
+        resultats = []
+        for j in liste_joueurs:
+            try:
+                hr = int(j.get('hr') or 0)
+            except (ValueError, TypeError):
+                hr = 0
+            if hr <= 0:
+                continue
+            nom_hangul = j.get('name', '') or ''
+            player_id = str(j.get('playerCode') or '')
+            nom_anglais = dict_noms_anglais.get(player_id)
+            nom_final = nom_anglais if nom_anglais else nom_hangul_vers_romanisation(nom_hangul)
+            resultats.append((nom_final, hr))
+        return resultats
+    except Exception:
+        # Ne doit jamais faire planter l'onglet Résumé : simplement pas de HR affiché.
+        return []
+
+
+def _formater_segment_hr(abbr: str, hr_liste: list) -> str:
+    """Formate les HR d'UNE équipe : 'LG: 2 (Kim, Austin)' ou 'LG: 0' si aucun HR."""
+    total = sum(hr for _, hr in hr_liste)
+    if total <= 0:
+        return f"{abbr}: 0"
+    noms = [nom if hr <= 1 else f"{nom} x{hr}" for nom, hr in hr_liste]
+    return f"{abbr}: {total} ({', '.join(noms)})"
+
+
+def _formater_cellule_hr(away_abbr: str, hr_away: list, home_abbr: str, hr_home: list) -> str:
+    """Combine les HR des deux équipes d'un match dans une seule cellule de tableau."""
+    return f"{_formater_segment_hr(away_abbr, hr_away)} | {_formater_segment_hr(home_abbr, hr_home)}"
+
+
+def _comparer_prediction_vs_score(pred, home_nom: str, away_nom: str, home_score: int, away_score: int, a_commence: bool):
+    """
+    Retourne (texte_comparatif, icone_resultat) pour la colonne "Résultat vs Algo".
+    - `pred` : ligne (pandas Series) issue de `df_victoires` (Hot Pronostics) pour ce match,
+      ou None si aucune prédiction n'est encore disponible (lanceurs partants pas encore
+      annoncés) -> ("Non disponible", "⏳").
+    - Sinon : l'équipe favorite est celle avec la probabilité de victoire la plus haute. On
+      compare cette équipe favorite à l'équipe actuellement en tête (ou gagnante si le match
+      est terminé) : ✅ si elle mène/a gagné, ❌ si elle est menée/a perdu, ⏳ si le match n'a
+      pas commencé ou si le score est à égalité.
+    """
+    if pred is None:
+        return "Non disponible", "⏳"
+
+    pct_home = pred.get('Proba Domicile (%)')
+    pct_away = pred.get('Proba Extérieur (%)')
+    if pct_home is None or pct_away is None or pd.isna(pct_home) or pd.isna(pct_away):
+        return "Non disponible", "⏳"
+
+    equipe_favorite = home_nom if pct_home >= pct_away else away_nom
+    pct_favori = max(pct_home, pct_away)
+    comparatif = f"{equipe_favorite} à {pct_favori:.0f}%"
+
+    if not a_commence or home_score == away_score:
+        return comparatif, "⏳"
+
+    equipe_en_tete = home_nom if home_score > away_score else away_nom
+    icone = "✅" if equipe_en_tete == equipe_favorite else "❌"
+    return comparatif, icone
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
+def construire_resume_matchs_du_jour_kbo(annee: int, cache_bust: int = 0):
+    """
+    Construit le tableau récapitulatif de TOUS les matchs KBO du jour (à venir, en cours,
+    terminés) pour l'onglet "Résumé". `cache_bust` sert uniquement à invalider le cache
+    Streamlit à la demande (bouton "Rafraîchir les scores en direct") - le calcul du modèle
+    de prédiction ("Hot Pronostics") n'est PAS reproduit à chaque rafraîchissement (il a son
+    propre cache à `ttl=1800`, car il ne change pas au fil du match), seuls les
+    scores/statuts/HR en direct sont re-récupérés.
+
+    Retourne (DataFrame, message_erreur). En cas d'échec réseau, le DataFrame est vide et
+    `message_erreur` contient un texte à afficher via `st.error` - aucune exception ne
+    remonte jamais à l'appelant (l'application ne doit jamais planter à cause d'un appel
+    réseau en direct).
+    """
+    if annee != ANNEE_COURANTE:
+        return pd.DataFrame(), None
+
+    try:
+        df_jour, _ = obtenir_calendrier_du_jour_kst()
+    except Exception as e:
+        return pd.DataFrame(), (
+            f"Impossible de récupérer les scores en direct pour le moment ({e}). "
+            "Réessayez dans quelques instants avec le bouton de rafraîchissement."
+        )
+
+    if df_jour.empty:
+        return pd.DataFrame(), None
+
+    try:
+        dict_noms_anglais = _dict_noms_anglais(annee)
+    except Exception:
+        dict_noms_anglais = {}
+
+    # Prédictions déjà calculées pour "Hot Pronostics" (même modèle, même journée),
+    # réutilisées ici pour la colonne "Comparatif Prédiction" - alignées par game_id (les
+    # deux fonctions parcourent le même calendrier du jour, dans le même ordre, mais on
+    # indexe explicitement par game_id pour rester robuste à tout changement d'ordre entre
+    # les deux appels).
+    try:
+        matchs_lineups, _, _, df_victoires = construire_donnees_hot_pronostics_kbo(annee)
+    except Exception:
+        matchs_lineups, df_victoires = [], pd.DataFrame()
+
+    predictions_par_game_id = {}
+    for idx, m in enumerate(matchs_lineups):
+        if idx < len(df_victoires):
+            predictions_par_game_id[m.get('game_id')] = df_victoires.iloc[idx]
+
+    lignes = []
+    for _, g in df_jour.iterrows():
+        game_id = g.get('game_id')
+        code_home = g.get('code_home') or '???'
+        code_away = g.get('code_away') or '???'
+        nom_home = TEAMS_KBO.get(code_home, g.get('nom_home') or '?')
+        nom_away = TEAMS_KBO.get(code_away, g.get('nom_away') or '?')
+
+        statut_str = _formater_statut_match_kbo(g)
+        a_commence = statut_str == "Terminé" or statut_str.startswith("En cours") or statut_str == "Suspendu"
+
+        try:
+            home_score = int(g.get('score_home') or 0)
+            away_score = int(g.get('score_away') or 0)
+        except (TypeError, ValueError):
+            home_score, away_score = 0, 0
+
+        if a_commence:
+            score_str = f"{code_away} {away_score} - {code_home} {home_score}"
+            # Colonne texte (pas numérique) volontairement : elle doit pouvoir afficher "—"
+            # pour les matchs pas encore commencés sans faire planter la sérialisation Arrow
+            # du tableau (colonne à types mixtes int/str sinon).
+            total_runs = str(home_score + away_score)
+            hr_home = obtenir_hr_joueurs_match_resume(game_id, True, dict_noms_anglais, cache_bust)
+            hr_away = obtenir_hr_joueurs_match_resume(game_id, False, dict_noms_anglais, cache_bust)
+            hr_str = _formater_cellule_hr(code_away, hr_away, code_home, hr_home)
+        else:
+            score_str = "—"
+            total_runs = "—"
+            hr_str = "—"
+
+        pred = predictions_par_game_id.get(game_id)
+        comparatif_str, resultat_icone = _comparer_prediction_vs_score(
+            pred, nom_home, nom_away, home_score, away_score, a_commence
+        )
+
+        lignes.append({
+            'Match': f"{nom_away} vs {nom_home}",
+            'Statut': statut_str,
+            'Score': score_str,
+            'Total Runs': total_runs,
+            'Home Runs': hr_str,
+            'Comparatif Prédiction': comparatif_str,
+            'Résultat vs Algo': resultat_icone,
+        })
+
+    return pd.DataFrame(lignes), None
+
+
+@st.fragment
+def afficher_onglet_resume_kbo(annee: int):
+    """
+    Corps de l'onglet "Résumé" (bouton de rafraîchissement + tableau), encapsulé dans un
+    `st.fragment` : cliquer sur le bouton ne relance QUE cette fonction (nouvel appel
+    réseau + reconstruction du tableau), sans recharger le reste de l'application (sidebar,
+    autres onglets) ni la page web entière.
+    """
+    if 'resume_cache_bust' not in st.session_state:
+        st.session_state.resume_cache_bust = 0
+    if 'resume_derniere_actualisation' not in st.session_state:
+        st.session_state.resume_derniere_actualisation = None
+
+    col_bouton, col_info = st.columns([1, 2])
+    with col_bouton:
+        if st.button("🔄 Rafraîchir les scores en direct"):
+            st.session_state.resume_cache_bust += 1
+            st.session_state.resume_derniere_actualisation = datetime.now(TZ_PARIS)
+
+    with col_info:
+        if st.session_state.resume_derniere_actualisation:
+            st.caption(
+                "Dernière actualisation manuelle : "
+                f"{st.session_state.resume_derniere_actualisation.strftime('%H:%M:%S')} (heure française)."
+            )
+        else:
+            st.caption("Cliquez sur le bouton pour actualiser les scores en direct.")
+
+    if annee != ANNEE_COURANTE:
+        st.info(
+            f"Le résumé du jour n'est disponible que pour la saison en cours "
+            f"({ANNEE_COURANTE}). Sélectionnez {ANNEE_COURANTE} dans le menu de gauche."
+        )
+        return
+
+    with st.spinner("Récupération des scores en direct..."):
+        df_resume, message_erreur = construire_resume_matchs_du_jour_kbo(
+            annee, st.session_state.resume_cache_bust
+        )
+
+    if message_erreur:
+        st.error(f"⚠️ {message_erreur}")
+
+    if df_resume.empty:
+        if message_erreur is None:
+            st.info("Aucun match n'est prévu aujourd'hui (heure de Corée).")
+        return
+
+    st.dataframe(
+        df_resume,
+        column_config={
+            "Match": st.column_config.TextColumn("Match", width="medium"),
+            "Statut": st.column_config.TextColumn("Statut", width="small"),
+            "Score": st.column_config.TextColumn("Score", width="small"),
+            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
+            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+            "Comparatif Prédiction": st.column_config.TextColumn("Comparatif Prédiction", width="medium"),
+            "Résultat vs Algo": st.column_config.TextColumn("Résultat vs Algo", width="small"),
+        },
+        hide_index=True,
+    )
+
+    st.caption(
+        "✅ = l'équipe favorite de notre algorithme mène ou a gagné · ❌ = elle est menée ou a "
+        "perdu · ⏳ = match pas encore commencé, à égalité, ou prédiction pas encore disponible. "
+        "Le score, le total de runs et les home runs ne sont affichés qu'une fois le match "
+        "commencé."
+    )
+
+
+# ============================================================
 # 6. INTERFACE PRINCIPALE
 # ============================================================
 
@@ -1760,16 +2078,26 @@ EQUIPES_KBO = get_teams_kbo(annee)
 # 7. ONGLETS PRINCIPAUX
 # ============================================================
 onglets = st.tabs([
+    "📊 Résumé",
     "🔥 Hot Pronostics",
     "📊 Analyse par Équipe",
     "🔮 Prédictions du jour"
 ], on_change="rerun")
 
 # --------------------------------------------------------------
-# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
+# ONGLET 0: RÉSUMÉ (scores en direct et terminés du jour)
 # --------------------------------------------------------------
 with onglets[0]:
     if onglets[0].open:
+        st.header("📊 Résumé du jour")
+        st.markdown("### Suivi en direct de toutes les confrontations KBO du jour")
+        afficher_onglet_resume_kbo(annee)
+
+# --------------------------------------------------------------
+# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
+# --------------------------------------------------------------
+with onglets[1]:
+    if onglets[1].open:
         st.header("🔥 Hot Pronostics du jour")
         st.markdown("### Les meilleurs pronostics du jour, tous matchs KBO confondus")
         st.caption(
@@ -1882,7 +2210,7 @@ with onglets[0]:
 # --------------------------------------------------------------
 # ONGLET 2: ANALYSE PAR ÉQUIPE
 # --------------------------------------------------------------
-with onglets[1]:
+with onglets[2]:
     st.header("📊 Analyse des Runs par Équipe")
 
     col1, col2 = st.columns([1, 3])
@@ -2104,7 +2432,7 @@ with onglets[1]:
 # --------------------------------------------------------------
 # ONGLET 3: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
-with onglets[2]:
+with onglets[3]:
     st.header("🔮 Prédictions du jour")
     st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_KBO.get(equipe_abbr, equipe_abbr)}**")
     st.caption(
