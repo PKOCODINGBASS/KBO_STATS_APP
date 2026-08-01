@@ -5,3 +5,4 @@ venv/
 .streamlit/secrets.toml
 .DS_Store
 *.log
+historique_predictions_kbo.json
