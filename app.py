@@ -1427,17 +1427,12 @@ def predire_joueurs_du_jour(cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, t
 # SEUILS DE PRÉDICTION PAR LIGUE ("Recommandation de Pari Optimisée")
 # --------------------------------------------------------------
 # Les moyennes offensives et l'ERA "normal" diffèrent fortement d'une ligue à l'autre
-# (la KBO est réputée plus offensive/haut-scoring que la MLB ou la NPB - terrains plus
-# petits, saison plus longue de matchs à forte intensité). Centraliser ces seuils dans
-# un dictionnaire clé = code ligue permet à `generer_recommandation_pari` de s'adapter
-# automatiquement à la ligue du match en cours (voir `detecter_ligue_match`), sans
-# jamais coder les seuils KBO "en dur" dans la logique elle-même.
-#
-# ⚠️ Seuils KBO estimés par défaut (à ajuster si des références statistiques plus
-# précises sont disponibles) : la KBO n'a pas été spécifiée avec des valeurs exactes,
-# contrairement à la MLB (ERA mauvais > 4.50 / excellent < 3.50 / runs hauts > 9.0).
-# On retient ici des seuils légèrement supérieurs à la MLB pour refléter le profil plus
-# offensif généralement observé en KBO.
+# (la KBO est réputée TRÈS offensive/haut-scoring, davantage encore que la MLB ou la
+# NPB - terrains plus petits, saison plus longue de matchs à forte intensité).
+# Centraliser ces seuils dans un dictionnaire clé = code ligue permet à
+# `generer_recommandation_pari` de s'adapter automatiquement à la ligue du match en
+# cours (voir `detecter_ligue_match`), sans jamais coder les seuils KBO "en dur" dans
+# la logique elle-même.
 LIGUE_PAR_DEFAUT = 'KBO'
 
 SEUILS_PARIS_PAR_LIGUE = {
@@ -1445,11 +1440,11 @@ SEUILS_PARIS_PAR_LIGUE = {
         # ERA d'un lanceur partant jugé "battable" (favorise un pari Over)
         'era_mauvais': 5.00,
         # ERA d'un lanceur partant jugé dominant (favorise un pari Under)
-        'era_excellent': 3.75,
+        'era_excellent': 4.00,
         # Total de runs (des deux équipes cumulé) au-delà duquel on considère la
-        # tendance du match comme offensive (KBO = ligue offensive, seuil plus haut
-        # qu'en MLB/NPB par exemple)
-        'runs_total_haut': 10.0,
+        # tendance du match comme offensive (KBO = ligue TRÈS offensive, seuil
+        # plus haut qu'en MLB/NPB par exemple)
+        'runs_total_haut': 10.5,
     },
 }
 
