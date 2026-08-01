@@ -2071,9 +2071,9 @@ def _top_candidats_hr_kbo(lineup_equipe: dict, dict_noms_anglais: dict, n: int =
     """
     Les `n` joueurs de la lineup probable d'une équipe les plus en forme au HR (10
     derniers matchs, même filtre "au moins 5 AB cumulés" que `construire_donnees_hot_
-    pronostics_kbo`, pour écarter le bruit d'un joueur tout juste rappelé), utilisés par
-    le bilan des prédictions de la veille (`_bilan_hr_kbo`) pour vérifier si l'un d'eux a
-    effectivement frappé un home run le lendemain.
+    pronostics_kbo`, pour écarter le bruit d'un joueur tout juste rappelé). Archivés
+    dans l'instantané du jour (historique des prédictions) pour d'éventuelles
+    analyses ultérieures.
     """
     if not lineup_equipe:
         return []
@@ -2332,21 +2332,16 @@ def _formater_statut_match_kbo(g) -> str:
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
-def obtenir_hr_joueurs_match_resume(game_id: str, est_domicile: bool, dict_noms_anglais: dict = None, cache_bust: int = 0):
+def obtenir_scoreurs_runs_et_hr_match_resume(game_id: str, est_domicile: bool,
+                                              dict_noms_anglais: dict = None, cache_bust: int = 0):
     """
-    Récupère, via le boxscore Naver Sports d'un match (endpoint "/record"), la liste des
-    home runs marqués par chaque joueur d'une équipe (domicile ou extérieur) sous forme de
-    tuples (nom_joueur, nb_hr). Fonction dédiée à l'onglet "Résumé" (plutôt que de réutiliser
-    `get_stats_offensives_match`, partagée avec l'onglet "Analyse par Équipe" et jamais
-    invalidée) car ici le match peut être EN COURS : `cache_bust` change la clé de cache
-    Streamlit à la demande (incrémenté par le bouton "Rafraîchir"), ce qui permet de forcer
-    un nouvel appel réseau sans dépendre d'un simple TTL. Le paramètre n'est jamais lu dans
-    le corps de la fonction, il ne sert qu'à invalider le cache. `ttl=3600` reste un filet de
-    sécurité pour éviter une croissance illimitée du cache, pas le mécanisme principal de
-    fraîcheur des données.
+    Récupère, via UN SEUL appel au boxscore Naver Sports d'un match (endpoint "/record"),
+    les runs ET les home runs marqués par chaque joueur d'une équipe. Retourne
+    (liste_runs, liste_hr) de tuples (nom_joueur, nb). Dédiée à l'onglet "Résumé" /
+    bilan de la veille : `cache_bust` invalide le cache à la demande.
     """
     if not game_id:
-        return []
+        return [], []
     dict_noms_anglais = dict_noms_anglais or {}
 
     url = f"{BASE_NAVER}/schedule/games/{game_id}/record"
@@ -2356,37 +2351,81 @@ def obtenir_hr_joueurs_match_resume(game_id: str, est_domicile: bool, dict_noms_
         batters_boxscore = record_data.get('battersBoxscore', {}) or {}
         liste_joueurs = batters_boxscore.get('home' if est_domicile else 'away', []) or []
 
-        resultats = []
+        runs_par_joueur = {}
+        hr_par_joueur = {}
         for j in liste_joueurs:
-            try:
-                hr = int(j.get('hr') or 0)
-            except (ValueError, TypeError):
-                hr = 0
-            if hr <= 0:
-                continue
             nom_hangul = j.get('name', '') or ''
             player_id = str(j.get('playerCode') or '')
             nom_anglais = dict_noms_anglais.get(player_id)
             nom_final = nom_anglais if nom_anglais else nom_hangul_vers_romanisation(nom_hangul)
-            resultats.append((nom_final, hr))
-        return resultats
+            try:
+                runs = int(j.get('run') or 0)
+            except (ValueError, TypeError):
+                runs = 0
+            try:
+                hr = int(j.get('hr') or 0)
+            except (ValueError, TypeError):
+                hr = 0
+            if runs > 0:
+                runs_par_joueur[nom_final] = runs_par_joueur.get(nom_final, 0) + runs
+            if hr > 0:
+                hr_par_joueur[nom_final] = hr_par_joueur.get(nom_final, 0) + hr
+        return list(runs_par_joueur.items()), list(hr_par_joueur.items())
     except Exception:
-        # Ne doit jamais faire planter l'onglet Résumé : simplement pas de HR affiché.
-        return []
+        return [], []
 
 
-def _formater_segment_hr(abbr: str, hr_liste: list) -> str:
-    """Formate les HR d'UNE équipe : 'LG: 2 (Kim, Austin)' ou 'LG: 0' si aucun HR."""
-    total = sum(hr for _, hr in hr_liste)
+def obtenir_hr_joueurs_match_resume(game_id: str, est_domicile: bool, dict_noms_anglais: dict = None, cache_bust: int = 0):
+    """
+    Compatibilité : retourne uniquement les home runs (liste de tuples (nom, nb_hr))
+    d'une équipe pour UN match. Délègue à `obtenir_scoreurs_runs_et_hr_match_resume`.
+    """
+    _, hrs = obtenir_scoreurs_runs_et_hr_match_resume(
+        game_id, est_domicile, dict_noms_anglais, cache_bust
+    )
+    return hrs
+
+
+def _formater_segment_scoreurs(abbr: str, scoreurs: list) -> str:
+    """Formate les scoreurs d'UNE équipe : 'LG: 2 (Kim, Austin)' ou 'LG: 0' si aucun."""
+    total = sum(nb for _, nb in scoreurs)
     if total <= 0:
         return f"{abbr}: 0"
-    noms = [nom if hr <= 1 else f"{nom} x{hr}" for nom, hr in hr_liste]
+    noms = [nom if nb <= 1 else f"{nom} x{nb}" for nom, nb in scoreurs]
     return f"{abbr}: {total} ({', '.join(noms)})"
 
 
 def _formater_cellule_hr(away_abbr: str, hr_away: list, home_abbr: str, hr_home: list) -> str:
     """Combine les HR des deux équipes d'un match dans une seule cellule de tableau."""
-    return f"{_formater_segment_hr(away_abbr, hr_away)} | {_formater_segment_hr(home_abbr, hr_home)}"
+    return (
+        f"{_formater_segment_scoreurs(away_abbr, hr_away)} | "
+        f"{_formater_segment_scoreurs(home_abbr, hr_home)}"
+    )
+
+
+def _formater_cellule_total_runs(total: int, away_abbr: str, runs_away: list,
+                                 home_abbr: str, runs_home: list) -> str:
+    """
+    Colonne "Total Runs" du bilan de la veille : total du match + détail des joueurs
+    ayant marqué un run. Ex: '11 — LG: 6 (Kim, Austin) | KT: 5 (Rojas)'
+    """
+    detail = (
+        f"{_formater_segment_scoreurs(away_abbr, runs_away)} | "
+        f"{_formater_segment_scoreurs(home_abbr, runs_home)}"
+    )
+    return f"{total} — {detail}"
+
+
+def _trouver_prediction_match_kbo(predictions_par_cle: dict, cle):
+    """Tolère int vs str pour les game_id après sérialisation JSON de l'historique."""
+    if cle in predictions_par_cle:
+        return predictions_par_cle[cle]
+    if cle is None:
+        return None
+    try:
+        return predictions_par_cle.get(int(cle)) or predictions_par_cle.get(str(cle))
+    except (TypeError, ValueError):
+        return predictions_par_cle.get(str(cle))
 
 
 def _comparer_prediction_vs_score(pred, home_nom: str, away_nom: str, home_score: int, away_score: int, a_commence: bool):
@@ -2483,27 +2522,24 @@ def _bilan_over_under_kbo(total_runs_predit, total_runs_reel: int, ligne: float)
     """Retourne (texte, icône) comparant la projection Over/Under d'hier au total réel."""
     if total_runs_predit is None:
         return "Prédiction non disponible", "⏳"
-    direction_predite = "Over" if total_runs_predit > ligne else "Under"
-    direction_reelle = "Over" if total_runs_reel > ligne else "Under"
-    icone = "✅" if direction_predite == direction_reelle else "❌"
+
+    def _direction(total):
+        if total > ligne:
+            return "Over"
+        if total < ligne:
+            return "Under"
+        return "Push"
+
+    direction_predite = _direction(total_runs_predit)
+    direction_reelle = _direction(total_runs_reel)
+    if direction_reelle == "Push":
+        icone = "⏳"
+    else:
+        icone = "✅" if direction_predite == direction_reelle else "❌"
     return (
         f"{direction_predite} annoncé (projection {total_runs_predit:.1f}, ligne {ligne:.1f}) "
         f"→ réel {total_runs_reel} ({direction_reelle})"
     ), icone
-
-
-def _bilan_hr_kbo(candidats_home: list, candidats_away: list, hr_home_reels: list, hr_away_reels: list):
-    """Retourne (texte, icône) : au moins un des joueurs surveillés hier a-t-il réellement frappé un HR ?"""
-    candidats = [c for c in (candidats_home or []) + (candidats_away or []) if c]
-    if not candidats:
-        return "Prédiction non disponible", "⏳"
-    scoreurs_reels = {nom for nom, _ in hr_home_reels} | {nom for nom, _ in hr_away_reels}
-    touches = [c for c in candidats if c in scoreurs_reels]
-    icone = "✅" if touches else "❌"
-    texte = f"Surveillés : {', '.join(candidats)}"
-    if touches:
-        texte += f" → a frappé : {', '.join(touches)}"
-    return texte, icone
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -2558,7 +2594,18 @@ def construire_bilan_veille_kbo(annee: int):
 
     predictions_hier = _charger_historique_predictions().get(date_hier_str, {}).get('matches', [])
     predictions_disponibles = len(predictions_hier) > 0
-    predictions_par_game_id = {p.get('game_id'): p for p in predictions_hier}
+    # Indexé à la fois en int et en str pour tolérer la sérialisation JSON.
+    predictions_par_game_id = {}
+    for p in predictions_hier:
+        gid = p.get('game_id')
+        if gid is None:
+            continue
+        predictions_par_game_id[gid] = p
+        predictions_par_game_id[str(gid)] = p
+        try:
+            predictions_par_game_id[int(gid)] = p
+        except (TypeError, ValueError):
+            pass
 
     ligne_ou = obtenir_ligne_over_under_saison_kbo(annee)
 
@@ -2576,31 +2623,35 @@ def construire_bilan_veille_kbo(annee: int):
             continue
         total_reel = home_score + away_score
 
-        hr_home = obtenir_hr_joueurs_match_resume(game_id, True, dict_noms_anglais)
-        hr_away = obtenir_hr_joueurs_match_resume(game_id, False, dict_noms_anglais)
+        runs_home, hr_home = obtenir_scoreurs_runs_et_hr_match_resume(
+            game_id, True, dict_noms_anglais
+        )
+        runs_away, hr_away = obtenir_scoreurs_runs_et_hr_match_resume(
+            game_id, False, dict_noms_anglais
+        )
 
-        pred = predictions_par_game_id.get(game_id)
-        candidats_hr_home = pred.get('candidats_hr_home', []) if pred else []
-        candidats_hr_away = pred.get('candidats_hr_away', []) if pred else []
+        pred = _trouver_prediction_match_kbo(predictions_par_game_id, game_id)
         proba_home = pred.get('proba_home') if pred else None
         proba_away = pred.get('proba_away') if pred else None
         total_predit = pred.get('total_runs_predit') if pred else None
 
-        texte_victoire, icone_victoire = _bilan_victoire_kbo(proba_home, proba_away, nom_home, nom_away, home_score, away_score)
+        texte_victoire, icone_victoire = _bilan_victoire_kbo(
+            proba_home, proba_away, nom_home, nom_away, home_score, away_score
+        )
         texte_ou, icone_ou = _bilan_over_under_kbo(total_predit, total_reel, ligne_ou)
-        texte_hr, icone_hr = _bilan_hr_kbo(candidats_hr_home, candidats_hr_away, hr_home, hr_away)
 
         lignes.append({
             'Match': f"{nom_away} vs {nom_home}",
             'Statut': "Terminé",
             'Score': f"{code_away} {away_score} - {code_home} {home_score}",
-            'Total Runs': str(total_reel),
-            'Home Runs': _formater_cellule_hr(code_away, hr_away, code_home, hr_home),
+            'Total Runs': _formater_cellule_total_runs(
+                total_reel, code_away, runs_away, code_home, runs_home
+            ),
+            'HR marqués': _formater_cellule_hr(code_away, hr_away, code_home, hr_home),
             'Vainqueur': _formater_vainqueur_kbo(nom_home, nom_away, home_score, away_score),
             'Victoire prédite': texte_victoire,
             'Over/Under prédit': texte_ou,
-            'HR surveillés': texte_hr,
-            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou} · HR {icone_hr}",
+            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou}",
         })
 
     return pd.DataFrame(lignes), None, predictions_disponibles
@@ -2646,13 +2697,12 @@ def afficher_bilan_predictions_veille_kbo(annee: int):
             "Match": st.column_config.TextColumn("Match", width="medium"),
             "Statut": st.column_config.TextColumn("Statut", width="small"),
             "Score": st.column_config.TextColumn("Score", width="small"),
-            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
-            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+            "Total Runs": st.column_config.TextColumn("Total Runs", width="large"),
+            "HR marqués": st.column_config.TextColumn("HR marqués", width="large"),
             "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
             "Victoire prédite": st.column_config.TextColumn("Victoire prédite", width="large"),
             "Over/Under prédit": st.column_config.TextColumn("Over/Under prédit", width="large"),
-            "HR surveillés": st.column_config.TextColumn("HR surveillés", width="large"),
-            "Bilan": st.column_config.TextColumn("Bilan", width="large"),
+            "Bilan": st.column_config.TextColumn("Bilan", width="medium"),
         },
         hide_index=True,
     )
@@ -2661,12 +2711,12 @@ def afficher_bilan_predictions_veille_kbo(annee: int):
         "**Méthodologie** — Victoire : ✅ si l'équipe favorite (probabilité la plus haute) a "
         "réellement gagné. Over/Under : ligne de référence = moyenne réelle de runs cumulés par "
         "match sur la saison en cours ; ✅ si notre projection (moyenne de runs des 10 derniers "
-        "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. HR : ✅ "
-        "si au moins un des joueurs les plus en forme au HR (10 derniers matchs) de chaque équipe "
-        "a effectivement frappé un home run dans ce match. ⏳ = aucune prédiction n'avait été "
-        "archivée pour ce match (application non consultée la veille) ou match nul. Les "
-        "prédictions ne sont archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est "
-        "consulté ce jour-là (pas de calcul en tâche de fond)."
+        "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. "
+        "Total Runs / HR marqués : détail des joueurs ayant réellement marqué, issu du "
+        "boxscore officiel. ⏳ = aucune prédiction n'avait été archivée pour ce match "
+        "(application non consultée la veille) ou match nul. Les prédictions ne sont "
+        "archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est consulté ce "
+        "jour-là (pas de calcul en tâche de fond)."
     )
 
 
