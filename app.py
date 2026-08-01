@@ -2642,7 +2642,6 @@ def construire_bilan_veille_kbo(annee: int):
 
         lignes.append({
             'Match': f"{nom_away} vs {nom_home}",
-            'Statut': "Terminé",
             'Score': f"{code_away} {away_score} - {code_home} {home_score}",
             'Total Runs': _formater_cellule_total_runs(
                 total_reel, code_away, runs_away, code_home, runs_home
@@ -2695,7 +2694,6 @@ def afficher_bilan_predictions_veille_kbo(annee: int):
         df_bilan,
         column_config={
             "Match": st.column_config.TextColumn("Match", width="medium"),
-            "Statut": st.column_config.TextColumn("Statut", width="small"),
             "Score": st.column_config.TextColumn("Score", width="small"),
             "Total Runs": st.column_config.TextColumn("Total Runs", width="large"),
             "HR marqués": st.column_config.TextColumn("HR marqués", width="large"),
