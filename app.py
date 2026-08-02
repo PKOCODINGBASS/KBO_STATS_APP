@@ -2807,9 +2807,17 @@ def construire_resume_matchs_du_jour_kbo(annee: int, cache_bust: int = 0):
             # Colonne texte (pas numérique) volontairement : elle doit pouvoir afficher "—"
             # pour les matchs pas encore commencés sans faire planter la sérialisation Arrow
             # du tableau (colonne à types mixtes int/str sinon).
-            total_runs = str(home_score + away_score)
-            hr_home = obtenir_hr_joueurs_match_resume(game_id, True, dict_noms_anglais, cache_bust)
-            hr_away = obtenir_hr_joueurs_match_resume(game_id, False, dict_noms_anglais, cache_bust)
+            # Runs + HR détaillés (même format que le bilan de la veille) pour le
+            # tableau en direct ET la vue cartes.
+            runs_home, hr_home = obtenir_scoreurs_runs_et_hr_match_resume(
+                game_id, True, dict_noms_anglais, cache_bust
+            )
+            runs_away, hr_away = obtenir_scoreurs_runs_et_hr_match_resume(
+                game_id, False, dict_noms_anglais, cache_bust
+            )
+            total_runs = _formater_cellule_total_runs(
+                home_score + away_score, code_away, runs_away, code_home, runs_home
+            )
             hr_str = _formater_cellule_hr(code_away, hr_away, code_home, hr_home)
         else:
             score_str = "—"
@@ -2901,7 +2909,7 @@ def afficher_onglet_resume_kbo(annee: int):
         "Match": st.column_config.TextColumn("Match", width="medium"),
         "Statut": st.column_config.TextColumn("Statut", width="small"),
         "Score": st.column_config.TextColumn("Score", width="small"),
-        "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
+        "Total Runs": st.column_config.TextColumn("Total Runs", width="large"),
         "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
         "Comparatif Prédiction": st.column_config.TextColumn("Comparatif Prédiction", width="medium"),
         "Résultat vs Algo": st.column_config.TextColumn("Résultat vs Algo", width="small"),
