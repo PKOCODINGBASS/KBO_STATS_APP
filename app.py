@@ -100,6 +100,24 @@ import unicodedata              # Normalisation des noms d'équipe (Value Bet De
 from datetime import datetime, timedelta  # Gestion des dates (timedelta : calcul de "hier")
 from zoneinfo import ZoneInfo   # Gestion des fuseaux horaires (KST <-> heure française)
 
+# Design system partagé (monorepo PARIS SPORTIFS) — cherche shared/ local puis parent
+import sys
+from pathlib import Path as _Path
+for _base in (_Path(__file__).resolve().parent, _Path(__file__).resolve().parent.parent):
+    if (_base / "shared" / "theme.py").is_file():
+        if str(_base) not in sys.path:
+            sys.path.insert(0, str(_base))
+        break
+from shared.theme import (  # noqa: E402
+    apply_theme,
+    render_page_header,
+    render_section_title,
+    afficher_cartes_matchs,
+    afficher_badge_value_bet,
+    render_footer,
+    render_prediction_match_banner,
+)
+
 # Remarque technique : contrairement à l'app NPB, `BeautifulSoup` n'est PAS utilisée ici.
 # La source de données retenue pour la KBO (API interne Naver Sports, voir docstring
 # ci-dessus) répond directement en JSON structuré : il n'y a donc aucune page HTML à
@@ -332,6 +350,8 @@ st.set_page_config(
     page_icon="⚾",
     layout="wide"
 )
+# Thème visuel KBO (bleu roi / blanc / argent + touche rouge) — n'altère aucune logique métier
+apply_theme("kbo")
 
 # ============================================================
 # 3. LISTE DES ÉQUIPES KBO (10 équipes, codes utilisés par l'API Naver Sports)
@@ -2877,18 +2897,19 @@ def afficher_onglet_resume_kbo(annee: int):
             st.info("Aucun match n'est prévu aujourd'hui (heure de Corée).")
         return
 
-    st.dataframe(
+    _resume_column_config = {
+        "Match": st.column_config.TextColumn("Match", width="medium"),
+        "Statut": st.column_config.TextColumn("Statut", width="small"),
+        "Score": st.column_config.TextColumn("Score", width="small"),
+        "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
+        "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+        "Comparatif Prédiction": st.column_config.TextColumn("Comparatif Prédiction", width="medium"),
+        "Résultat vs Algo": st.column_config.TextColumn("Résultat vs Algo", width="small"),
+    }
+    afficher_cartes_matchs(
         df_resume,
-        column_config={
-            "Match": st.column_config.TextColumn("Match", width="medium"),
-            "Statut": st.column_config.TextColumn("Statut", width="small"),
-            "Score": st.column_config.TextColumn("Score", width="small"),
-            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
-            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
-            "Comparatif Prédiction": st.column_config.TextColumn("Comparatif Prédiction", width="medium"),
-            "Résultat vs Algo": st.column_config.TextColumn("Résultat vs Algo", width="small"),
-        },
-        hide_index=True,
+        show_table_fallback=True,
+        column_config=_resume_column_config,
     )
 
     st.caption(
@@ -2903,8 +2924,11 @@ def afficher_onglet_resume_kbo(annee: int):
 # 6. INTERFACE PRINCIPALE
 # ============================================================
 
-st.title("⚾ Analyse Statistiques KBO (Korea Baseball Organization)")
-st.markdown("### Explorez les runs, les prédictions du jour et les tendances W/L")
+render_page_header(
+    "Analyse Statistiques KBO",
+    "Explorez les runs, les prédictions du jour et les tendances W/L",
+    league="kbo",
+)
 
 # Sidebar pour les paramètres globaux
 with st.sidebar:
@@ -2962,8 +2986,10 @@ onglets = st.tabs([
 # --------------------------------------------------------------
 with onglets[0]:
     if onglets[0].open:
-        st.header("📊 Résumé du jour")
-        st.markdown("### Suivi en direct de toutes les confrontations KBO du jour")
+        render_section_title(
+            "Résumé du jour",
+            "Suivi en direct de toutes les confrontations KBO du jour",
+        )
         afficher_onglet_resume_kbo(annee)
 
 # --------------------------------------------------------------
@@ -2971,8 +2997,10 @@ with onglets[0]:
 # --------------------------------------------------------------
 with onglets[1]:
     if onglets[1].open:
-        st.header("🔥 Hot Pronostics du jour")
-        st.markdown("### Les meilleurs pronostics du jour, tous matchs KBO confondus")
+        render_section_title(
+            "Hot Pronostics du jour",
+            "Les meilleurs pronostics du jour, tous matchs KBO confondus",
+        )
         st.caption(
             "⚠️ Estimations statistiques automatiques calculées à partir des lineups PROBABLES "
             "(estimées d'après le dernier match connu de chaque équipe - l'API KBO utilisée par "
@@ -3258,8 +3286,10 @@ with onglets[2]:
 # ONGLET 3: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
 with onglets[3]:
-    st.header("🔮 Prédictions du jour")
-    st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_KBO.get(equipe_abbr, equipe_abbr)}**")
+    render_section_title(
+        "Prédictions du jour",
+        f"Prédiction du match du jour pour les {EQUIPES_KBO.get(equipe_abbr, equipe_abbr)}",
+    )
     st.caption(
         "⚠️ Estimations statistiques basées sur les tendances récentes de l'équipe et les stats du "
         "lanceur adverse. Ce ne sont pas des garanties de résultat : à utiliser uniquement à titre "
@@ -3287,8 +3317,9 @@ with onglets[3]:
             st.info(f"Aucun match n'est prévu aujourd'hui (heure de Corée) pour les {EQUIPES_KBO.get(equipe_abbr, equipe_abbr)}.")
         else:
             lieu = "à domicile" if match_du_jour['est_domicile'] else "à l'extérieur"
-            st.subheader(
-                f"🆚 {EQUIPES_KBO.get(equipe_abbr, equipe_abbr)} {lieu} contre {match_du_jour['adversaire']}"
+            render_prediction_match_banner(
+                f"{EQUIPES_KBO.get(equipe_abbr, equipe_abbr)} {lieu} contre {match_du_jour['adversaire']}",
+                "Fiche match · lanceurs · probabilités · Value Bet",
             )
 
             col_venue, col_heure_kst, col_heure_paris, col_statut = st.columns(4)
@@ -3464,14 +3495,7 @@ with onglets[3]:
                             pct_adverse, cotes_match['cote_adverse'], match_du_jour['adversaire'], cotes_match['bookmaker']
                         ),
                     ):
-                        if not message:
-                            continue
-                        if niveau == 'value':
-                            st.success(message)
-                        elif niveau == 'evitez':
-                            st.error(message)
-                        else:
-                            st.info(message)
+                        afficher_badge_value_bet(niveau, message)
 
                     st.caption(
                         f"Cotes Moneyline (marché h2h) fournies par {cotes_match['bookmaker']} "
@@ -3533,10 +3557,4 @@ with onglets[3]:
 # 7bis. PIED DE PAGE
 # ============================================================
 st.markdown("---")
-st.markdown(
-    f"<div style='text-align: center; color: gray;'>"
-    f"⚾ Application KBO Analytics | Données : API Naver Sports (non officielle) | Mise à jour: "
-    f"{datetime.now(TZ_SEOUL).strftime('%Y-%m-%d %H:%M')} KST"
-    f"</div>",
-    unsafe_allow_html=True
-)
+render_footer("KBO", datetime.now(TZ_SEOUL).strftime('%Y-%m-%d %H:%M') + " KST")
