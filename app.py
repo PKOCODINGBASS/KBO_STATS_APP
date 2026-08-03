@@ -2038,14 +2038,8 @@ def _normaliser_colonne_hp(serie: pd.Series) -> pd.Series:
     return (serie - minimum) / (maximum - minimum)
 
 
-def _calculer_top5_home_runs_kbo(candidats: list) -> pd.DataFrame:
-    """
-    Construit le classement "Top 5 Home Runs probables" à partir de la liste de candidats
-    (un dict par titulaire probable d'un match du jour). Indice pondéré : SLG récent
-    estimé 45% + HR/10 derniers matchs 35% + HR/9 du lanceur adverse 20% (les 3 facteurs
-    demandés), chaque métrique étant normalisée (min-max) sur l'ensemble des candidats du
-    jour avant pondération.
-    """
+def _classer_candidats_home_runs_kbo(candidats: list) -> pd.DataFrame:
+    """Classe TOUS les candidats HR (même formule que le Top 5) — affichage uniquement."""
     if not candidats:
         return pd.DataFrame()
     df = pd.DataFrame(candidats)
@@ -2055,20 +2049,29 @@ def _calculer_top5_home_runs_kbo(candidats: list) -> pd.DataFrame:
         + _normaliser_colonne_hp(df['HR/9 lanceur adverse']) * 0.20
     ) * 100
     df['Indice HR (/100)'] = indice.round(1)
-    df = df.sort_values('Indice HR (/100)', ascending=False).head(5).reset_index(drop=True)
+    df = df.sort_values('Indice HR (/100)', ascending=False).reset_index(drop=True)
     return df[[
         'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
         'SLG récent (estimé)', 'HR (10 derniers matchs)', 'HR/9 lanceur adverse', 'Indice HR (/100)'
     ]]
 
 
-def _calculer_top5_runs_kbo(candidats: list) -> pd.DataFrame:
+def _calculer_top5_home_runs_kbo(candidats: list) -> pd.DataFrame:
     """
-    Construit le classement "Top 5 joueurs pour marquer un run" à partir de la liste de
-    candidats. Indice pondéré : OBP récent estimé 45% + bonus de position dans la lineup
-    probable (favorise les positions 1 à 4) 25% + ERA du lanceur adverse 30%, chaque
-    métrique étant normalisée (min-max) sur l'ensemble des candidats du jour.
+    Construit le classement "Top 5 Home Runs probables" à partir de la liste de candidats
+    (un dict par titulaire probable d'un match du jour). Indice pondéré : SLG récent
+    estimé 45% + HR/10 derniers matchs 35% + HR/9 du lanceur adverse 20% (les 3 facteurs
+    demandés), chaque métrique étant normalisée (min-max) sur l'ensemble des candidats du
+    jour avant pondération.
     """
+    df = _classer_candidats_home_runs_kbo(candidats)
+    if df.empty:
+        return df
+    return df.head(5).reset_index(drop=True)
+
+
+def _classer_candidats_runs_kbo(candidats: list) -> pd.DataFrame:
+    """Classe TOUS les candidats Run (même formule que le Top 5) — affichage uniquement."""
     if not candidats:
         return pd.DataFrame()
     df = pd.DataFrame(candidats)
@@ -2081,11 +2084,43 @@ def _calculer_top5_runs_kbo(candidats: list) -> pd.DataFrame:
         + _normaliser_colonne_hp(df['ERA lanceur adverse']) * 0.30
     ) * 100
     df['Indice Run (/100)'] = indice.round(1)
-    df = df.sort_values('Indice Run (/100)', ascending=False).head(5).reset_index(drop=True)
+    df = df.sort_values('Indice Run (/100)', ascending=False).reset_index(drop=True)
     return df[[
         'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
         'OBP récent (estimé)', 'Position probable', 'ERA lanceur adverse', 'Indice Run (/100)'
     ]]
+
+
+def _calculer_top5_runs_kbo(candidats: list) -> pd.DataFrame:
+    """
+    Construit le classement "Top 5 joueurs pour marquer un run" à partir de la liste de
+    candidats. Indice pondéré : OBP récent estimé 45% + bonus de position dans la lineup
+    probable (favorise les positions 1 à 4) 25% + ERA du lanceur adverse 30%, chaque
+    métrique étant normalisée (min-max) sur l'ensemble des candidats du jour.
+    """
+    df = _classer_candidats_runs_kbo(candidats)
+    if df.empty:
+        return df
+    return df.head(5).reset_index(drop=True)
+
+
+def _meilleure_reco_joueur_match(df_ranked, home: str, away: str, indice_col: str):
+    """Meilleur joueur déjà classé pour une confrontation — sans recalcul."""
+    if df_ranked is None or getattr(df_ranked, 'empty', True):
+        return None
+    mask = (
+        ((df_ranked['Équipe'] == home) & (df_ranked['Adversaire'] == away))
+        | ((df_ranked['Équipe'] == away) & (df_ranked['Adversaire'] == home))
+    )
+    sous = df_ranked.loc[mask]
+    if sous.empty:
+        return None
+    best = sous.iloc[0]
+    return {
+        'joueur': best.get('Joueur'),
+        'equipe': best.get('Équipe'),
+        'indice': best.get(indice_col),
+    }
 
 
 def _total_runs_predit_kbo(moyenne_home, moyenne_away):
@@ -2135,11 +2170,11 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
     Retourne (matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires).
     """
     if annee != ANNEE_COURANTE:
-        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df_jour, maintenant_kst = obtenir_calendrier_du_jour_kst()
     if df_jour.empty:
-        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     effectifs = _charger_effectifs_saison(annee)
     dict_noms_anglais = _dict_noms_anglais(annee)
@@ -2178,7 +2213,7 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
         })
 
     if not matchs_du_jour:
-        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Une seule estimation de lineup probable + forme récente par équipe présente
     # aujourd'hui (pas par match), même si une équipe jouait deux fois le même jour.
@@ -2273,8 +2308,10 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
                     'ERA lanceur adverse': round(era_adverse, 2),
                 })
 
-    df_top5_hr = _calculer_top5_home_runs_kbo(candidats_hr)
-    df_top5_runs = _calculer_top5_runs_kbo(candidats_runs)
+    df_hr_all = _classer_candidats_home_runs_kbo(candidats_hr)
+    df_runs_all = _classer_candidats_runs_kbo(candidats_runs)
+    df_top5_hr = df_hr_all.head(5).reset_index(drop=True) if not df_hr_all.empty else df_hr_all
+    df_top5_runs = df_runs_all.head(5).reset_index(drop=True) if not df_runs_all.empty else df_runs_all
     df_victoires = pd.DataFrame(lignes_victoire)
 
     # --- Archivage de l'instantané du jour (pour le "Bilan des Prédictions" de la veille,
@@ -2301,7 +2338,7 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
     ]
     _sauvegarder_predictions_du_jour(maintenant_kst.strftime('%Y-%m-%d'), matches_snapshot)
 
-    return matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires
+    return matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires, df_hr_all, df_runs_all
 
 
 # ============================================================
@@ -2631,7 +2668,13 @@ def formater_recommandation_totaux_over_under(total_projete, ligne):
     )
 
 
-def assembler_lignes_recap_hot_pronostics(matchs_jour: list, df_victoires, annee: int) -> list:
+def assembler_lignes_recap_hot_pronostics(
+    matchs_jour: list,
+    df_victoires,
+    annee: int,
+    df_hr_all=None,
+    df_runs_all=None,
+) -> list:
     """
     Agrège le tableau de bord Hot Pronostics à partir des données DÉJÀ calculées
     (`construire_donnees_hot_pronostics_kbo`) + caches existants (ligne O/U, cotes, moyennes).
@@ -2687,6 +2730,9 @@ def assembler_lignes_recap_hot_pronostics(matchs_jour: list, df_victoires, annee
         )
         classement_ou = classer_recommandation_totaux_over_under(total_proj, ligne_ou)
 
+        reco_hr = _meilleure_reco_joueur_match(df_hr_all, home, away, 'Indice HR (/100)')
+        reco_run = _meilleure_reco_joueur_match(df_runs_all, home, away, 'Indice Run (/100)')
+
         lignes.append({
             'confrontation': f"{away} vs {home}",
             'heure': f"⏰ {heure}" if heure and heure != '—' else "⏰ —",
@@ -2696,6 +2742,18 @@ def assembler_lignes_recap_hot_pronostics(matchs_jour: list, df_victoires, annee
             'value_label': value_label,
             'ou_kind': classement_ou['code'] if classement_ou else None,
             'ou_resume': classement_ou['resume'] if classement_ou else 'Projection indisponible',
+            'reco_hr': (
+                f"{reco_hr['joueur']} ({reco_hr['equipe']})" if reco_hr and reco_hr.get('joueur') else None
+            ),
+            'reco_hr_detail': (
+                f"Indice {reco_hr['indice']:.0f}/100" if reco_hr and reco_hr.get('indice') is not None else None
+            ),
+            'reco_run': (
+                f"{reco_run['joueur']} ({reco_run['equipe']})" if reco_run and reco_run.get('joueur') else None
+            ),
+            'reco_run_detail': (
+                f"Indice {reco_run['indice']:.0f}/100" if reco_run and reco_run.get('indice') is not None else None
+            ),
         })
     return lignes
 
@@ -2914,7 +2972,7 @@ def construire_resume_matchs_du_jour_kbo(annee: int, cache_bust: int = 0):
     # indexe explicitement par game_id pour rester robuste à tout changement d'ordre entre
     # les deux appels).
     try:
-        matchs_lineups, _, _, df_victoires = construire_donnees_hot_pronostics_kbo(annee)
+        matchs_lineups, _, _, df_victoires, *_ = construire_donnees_hot_pronostics_kbo(annee)
     except Exception:
         matchs_lineups, df_victoires = [], pd.DataFrame()
 
@@ -3159,8 +3217,12 @@ with onglets[1]:
                 "récente)... Premier chargement potentiellement long (plusieurs dizaines "
                 "d'appels réseau), les suivants seront quasi instantanés grâce au cache."
             ):
-                matchs_jour, df_top5_hr, df_top5_runs, df_victoires = construire_donnees_hot_pronostics_kbo(annee)
-                lignes_recap = assembler_lignes_recap_hot_pronostics(matchs_jour, df_victoires, annee)
+                matchs_jour, df_top5_hr, df_top5_runs, df_victoires, df_hr_all, df_runs_all = (
+                    construire_donnees_hot_pronostics_kbo(annee)
+                )
+                lignes_recap = assembler_lignes_recap_hot_pronostics(
+                    matchs_jour, df_victoires, annee, df_hr_all, df_runs_all
+                )
 
             if not matchs_jour:
                 st.info("Aucun match KBO n'est prévu aujourd'hui (heure de Corée).")
