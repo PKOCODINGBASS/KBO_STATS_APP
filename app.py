@@ -2162,6 +2162,27 @@ def _top_candidats_hr_kbo(lineup_equipe: dict, dict_noms_anglais: dict, n: int =
     return [nom for nom, _ in candidats[:n]]
 
 
+def _top_candidats_runs_kbo(lineup_equipe: dict, dict_noms_anglais: dict, n: int = 2) -> list:
+    """
+    Les `n` joueurs de la lineup probable les plus susceptibles de marquer un run
+    (OBP récent estimé, puis position haute dans l'ordre de frappe — mêmes signaux
+    que le classement Hot Pronostics Runs). Archivés pour le bilan de la veille.
+    """
+    if not lineup_equipe:
+        return []
+    candidats = [
+        (
+            dict_noms_anglais.get(player_code) or nom_hangul_vers_romanisation(infos['nom_hangul']),
+            _estimer_obp_recent(infos['ab_10'], infos['hit_10'], infos['bb_10']),
+            infos.get('position_probable') or 99,
+        )
+        for player_code, infos in lineup_equipe.items()
+        if infos.get('ab_10', 0) >= 5
+    ]
+    candidats.sort(key=lambda x: (-x[1], x[2]))
+    return [nom for nom, _, _ in candidats[:n]]
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def construire_donnees_hot_pronostics_kbo(annee: int):
     """
@@ -2323,7 +2344,7 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
     # onglet Résumé, cf. `_sauvegarder_predictions_du_jour`) : on ne conserve que ce qui
     # est nécessaire à une comparaison ultérieure avec le résultat réel une fois le match
     # terminé (probabilité de victoire, total de runs projeté pour les deux équipes, et
-    # candidats HR les plus en forme de chaque équipe).
+    # candidats HR / Run de chaque équipe).
     matches_snapshot = [
         {
             'game_id': m.get('game_id'),
@@ -2338,6 +2359,8 @@ def construire_donnees_hot_pronostics_kbo(annee: int):
             ),
             'candidats_hr_home': _top_candidats_hr_kbo(lineups_par_equipe.get(m['code_home'], {}), dict_noms_anglais),
             'candidats_hr_away': _top_candidats_hr_kbo(lineups_par_equipe.get(m['code_away'], {}), dict_noms_anglais),
+            'candidats_runs_home': _top_candidats_runs_kbo(lineups_par_equipe.get(m['code_home'], {}), dict_noms_anglais),
+            'candidats_runs_away': _top_candidats_runs_kbo(lineups_par_equipe.get(m['code_away'], {}), dict_noms_anglais),
         }
         for m, ligne_victoire in zip(matchs_du_jour, lignes_victoire)
     ]
@@ -2617,6 +2640,52 @@ def _bilan_over_under_kbo(total_runs_predit, total_runs_reel: int, ligne: float)
     ), icone
 
 
+def _normaliser_nom_joueur_kbo(texte: str) -> str:
+    """Normalise un nom de joueur sans supprimer les caractères non-ASCII (hangul)."""
+    return unicodedata.normalize('NFKC', texte or '').lower().strip()
+
+
+def _noms_joueurs_correspondent_kbo(nom_predit: str, nom_reel: str) -> bool:
+    """Correspondance assouplie entre un nom archivé et un nom boxscore."""
+    pred = _normaliser_nom_joueur_kbo(nom_predit)
+    reel = _normaliser_nom_joueur_kbo(nom_reel)
+    if not pred or not reel:
+        return False
+    if pred == reel or pred in reel or reel in pred:
+        return True
+    pred_parts, reel_parts = pred.split(), reel.split()
+    if pred_parts and reel_parts and pred_parts[-1] == reel_parts[-1] and len(pred_parts[-1]) > 2:
+        return True
+    return False
+
+
+def _bilan_joueurs_predits_kbo(candidats_home, candidats_away, scoreurs_home, scoreurs_away, label: str):
+    """
+    Retourne (texte, icône) pour les colonnes "HR prédit" / "Run prédit" du bilan :
+    ✅ si au moins un candidat archivé apparaît parmi les scoreurs réels du match,
+    ❌ si des candidats étaient archivés mais aucun n'a marqué, ⏳ sinon.
+    """
+    preds = []
+    vus = set()
+    for nom in list(candidats_home or []) + list(candidats_away or []):
+        if not nom or nom in vus:
+            continue
+        vus.add(nom)
+        preds.append(nom)
+    if not preds:
+        return "Prédiction non disponible", "⏳"
+
+    scoreurs = list(scoreurs_home or []) + list(scoreurs_away or [])
+    valides = [
+        p for p in preds
+        if any(nb and _noms_joueurs_correspondent_kbo(p, nom_reel) for nom_reel, nb in scoreurs)
+    ]
+    liste_pred = ", ".join(preds[:4])
+    if valides:
+        return f"{label} : {liste_pred} → validés : {', '.join(valides)}", "✅"
+    return f"{label} : {liste_pred} → aucun validé", "❌"
+
+
 def classer_recommandation_totaux_over_under(total_projete, ligne):
     """
     Comparaison mathématique finale UNIQUEMENT (aucune modification du moteur) :
@@ -2878,6 +2947,16 @@ def construire_bilan_veille_kbo(annee: int):
             proba_home, proba_away, nom_home, nom_away, home_score, away_score
         )
         texte_ou, icone_ou = _bilan_over_under_kbo(total_predit, total_reel, ligne_ou)
+        texte_hr, icone_hr = _bilan_joueurs_predits_kbo(
+            pred.get('candidats_hr_home') if pred else None,
+            pred.get('candidats_hr_away') if pred else None,
+            hr_home, hr_away, "HR",
+        )
+        texte_run, icone_run = _bilan_joueurs_predits_kbo(
+            pred.get('candidats_runs_home') if pred else None,
+            pred.get('candidats_runs_away') if pred else None,
+            runs_home, runs_away, "Run",
+        )
 
         lignes.append({
             'Match': f"{nom_away} vs {nom_home}",
@@ -2889,6 +2968,8 @@ def construire_bilan_veille_kbo(annee: int):
             'Vainqueur': _formater_vainqueur_kbo(nom_home, nom_away, home_score, away_score),
             'Victoire prédite': f"{icone_victoire} {texte_victoire}",
             'Over/Under prédit': f"{icone_ou} {texte_ou}",
+            'HR prédit': f"{icone_hr} {texte_hr}",
+            'Run prédit': f"{icone_run} {texte_run}",
         })
 
     return pd.DataFrame(lignes), None, predictions_disponibles
@@ -2938,6 +3019,8 @@ def afficher_bilan_predictions_veille_kbo(annee: int):
             "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
             "Victoire prédite": st.column_config.TextColumn("Victoire prédite", width="large"),
             "Over/Under prédit": st.column_config.TextColumn("Over/Under prédit", width="large"),
+            "HR prédit": st.column_config.TextColumn("HR prédit", width="large"),
+            "Run prédit": st.column_config.TextColumn("Run prédit", width="large"),
         },
         hide_index=True,
     )
@@ -2947,11 +3030,12 @@ def afficher_bilan_predictions_veille_kbo(annee: int):
         "réellement gagné. Over/Under : ligne de référence = moyenne réelle de runs cumulés par "
         "match sur la saison en cours ; ✅ si notre projection (moyenne de runs des 10 derniers "
         "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. "
-        "Total Runs / HR marqués : détail des joueurs ayant réellement marqué, issu du "
-        "boxscore officiel. ⏳ = aucune prédiction n'avait été archivée pour ce match "
-        "(application non consultée la veille) ou match nul. Les prédictions ne sont "
-        "archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est consulté ce "
-        "jour-là (pas de calcul en tâche de fond)."
+        "HR prédit / Run prédit : ✅ si au moins un candidat archivé (top forme Hot Pronostics "
+        "par équipe) a réellement marqué un HR / un run. Total Runs / HR marqués : détail des "
+        "joueurs ayant réellement marqué, issu du boxscore officiel. ⏳ = aucune prédiction "
+        "n'avait été archivée pour ce match (application non consultée la veille) ou match nul. "
+        "Les prédictions ne sont archivées qu'au moment où l'onglet Résumé ou Hot Pronostics "
+        "est consulté ce jour-là (pas de calcul en tâche de fond)."
     )
 
 
